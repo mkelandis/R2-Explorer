@@ -34,6 +34,8 @@ import type {
 } from "./types";
 
 export function R2Explorer(config?: R2ExplorerConfig) {
+
+
 	extendZodWithOpenApi(z);
 	config = config || {};
 	if (config.readonly !== false) config.readonly = true;

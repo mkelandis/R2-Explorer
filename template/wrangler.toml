@@ -8,3 +8,8 @@ assets = { directory = "node_modules/r2-explorer/dashboard", binding = "ASSETS",
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "cms-hintercraft-com"
+preview_bucket_name = 'cms-hintercraft-com'
+
+[vars]
+CF_ACCESS_TEAM_NAME = "hintercraft"
+DEBUG_LOGS = "true"  # or "false" in production

@@ -11,10 +11,14 @@ export default {
       if (env.DEBUG_LOGS === "true") console.log(...args);
     };
 
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // ✅ Authenticate with CF Access
     const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
     if (!jwt) return new Response("Unauthorized", { status: 401 });
 
-    let claims;
+    let claims: any;
     try {
       claims = JSON.parse(atob(jwt.split('.')[1]));
     } catch (e) {
@@ -24,63 +28,22 @@ export default {
 
     const email = claims.email;
     if (!email) return new Response("Missing email", { status: 403 });
+    log("🔐 Authenticated user:", email);
 
-    log("🔐 User:", email);
-
-    // Load access-control config
-    let folders: string[] = [];
+    // ✅ Load access config from BUCKET
+    let allowedPaths: string[] = [];
     try {
       const configFile = await env.BUCKET.get("access-control/config.json");
       const config = configFile ? JSON.parse(await configFile.text()) : {};
-      folders = config[email] || [];
+      allowedPaths = config[email] || [];
     } catch (err) {
       console.error("❌ Failed to load config.json:", err);
       return new Response("Access config error", { status: 500 });
     }
+    log("🔒 Folder permissions:", allowedPaths);
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    //
-    // ✅ /api/list: allow + filter
-    //
-    if (path.startsWith('/api/list')) {
-      const prefix = url.searchParams.get("prefix") || "";
-      const list = await env.BUCKET.list({ prefix });
-
-      if (folders.includes("*")) {
-        log(`📂 Full listing for ${email}`);
-        return new Response(JSON.stringify(list), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
-      const isAllowed = (key: string) => folders.some(folder => key.startsWith(folder));
-      const filtered = {
-        ...list,
-        objects: list.objects.filter(obj => isAllowed(obj.key)),
-        prefixes: list.prefixes?.filter(p => isAllowed(p))
-      };
-
-      log(`📂 Filtered listing for ${email}:`, filtered.objects.map(f => f.key));
-      return new Response(JSON.stringify(filtered), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    //
-    // ✅ /api/buckets/:bucket: allow if prefix is permitted
-    //
-    if (path.startsWith('/api/buckets/')) {
-      const prefix = url.searchParams.get("prefix") || "";
-      const allowed = folders.includes("*") || folders.some(folder => prefix.startsWith(folder));
-
-      log(`📦 Metadata prefix check: ${prefix} → ${allowed ? "✔️ allowed" : "❌ denied"}`);
-
-      if (!allowed) {
-        return new Response("Forbidden", { status: 403 });
-      }
-    }
+    const isAllowed = (path: string) =>
+      allowedPaths.some(allowedPath => path.startsWith(allowedPath));
 
     //
     // ✅ Allow /api/server/config
@@ -91,20 +54,67 @@ export default {
       !path.startsWith('/api/list') &&
       !path.startsWith('/api/buckets/');
 
+    //
+    // ✅ Protect upload/view/delete routes
+    //
     if (isProtectedApi) {
       const key = url.searchParams.get("key") || "";
-      const allowed = folders.includes("*") || folders.some(prefix => key.startsWith(prefix));
+      const allowed = allowedPaths.includes("*") || isAllowed(key);
 
-      log(`🔍 Key access: ${key} → ${allowed ? "✔️ allowed" : "❌ denied"}`);
-
+      log(`🔐 Key access check: ${key} → ${allowed ? "✔️ allowed" : "❌ denied"}`);
       if (!allowed) {
         return new Response("Forbidden", { status: 403 });
       }
     }
 
-    //
-    // ✅ Fallback to R2Explorer for everything else
-    //
-    return explorer.fetch(request, env, ctx);
+
+    // ✅ Pass request to R2Explorer
+    const explorerResponse = await explorer.fetch(request, env, ctx);
+
+    // ✅ Intercept list endpoints to filter based on folder access
+    if (path.startsWith('/api/list') || path.startsWith('/api/buckets/')) {
+      const contentType = explorerResponse.headers.get("Content-Type") || "";
+      if (!contentType.includes("application/json")) return explorerResponse;
+
+      let data: any;
+      try {
+        data = await explorerResponse.clone().json();
+      } catch (e) {
+        log("❌ Failed to parse explorer response JSON:", e);
+        return explorerResponse;
+      }
+
+      log("📦 Raw response from explorer:", data);
+
+      if (allowedPaths.includes("*")) {
+        log("✅ Wildcard access — returning unfiltered data");
+        return explorerResponse;
+      }
+
+      const filtered = {
+        ...data,
+        objects: data.objects?.filter((obj: any) => {
+          const allowed = isAllowed(obj.key);
+          log(`${allowed ? "✅" : "❌"} object "${obj.key}"`);
+          return allowed;
+        }),
+        delimitedPrefixes: data.delimitedPrefixes?.filter((prefix: string) => {
+          const allowed = isAllowed(prefix);
+          log(`${allowed ? "✅" : "❌"} prefix "${prefix}"`);
+          return allowed;
+        })
+      };
+
+      return new Response(JSON.stringify(filtered), {
+        status: explorerResponse.status,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store'
+        }
+      });
+    }
+
+    // ✅ Otherwise, allow R2Explorer to handle the request
+    return explorerResponse;
   }
 };
